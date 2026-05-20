@@ -13,6 +13,24 @@ const N_LEFT_PAD_TOKENS: usize = 32;
 /// Number of silence tokens to right-pad audio (matches voxmlx reference).
 const N_RIGHT_PAD_TOKENS: usize = 17;
 
+/// Log-mel floor policy. Voxtral uses a global constant; Whisper clamps per-spectrogram against the max.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum LogMelFloor {
+    /// Whisper: floor = max(log_mel) - 8.0, computed per spectrogram after the FFT loop.
+    PerSpectrogramMax,
+    /// Voxtral: floor = `global_log_mel_max` - 8.0, fixed up front.
+    GlobalConstant(f32),
+}
+
+/// Padding policy for the audio stream prior to STFT.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum AudioPaddingPolicy {
+    /// Voxtral: `left` and `right` silence tokens (samples = tokens * samples_per_token).
+    SilenceTokens { left: usize, right: usize },
+    /// Whisper: pad or trim to a fixed number of mel frames (3000 for 30 s at 100 Hz hop).
+    PadOrTrim(usize),
+}
+
 /// Whisper-style mel spectrogram processor for Voxtral audio encoder.
 pub struct VoxtralAudioProcessor {
     sampling_rate: u32,
@@ -32,6 +50,26 @@ impl VoxtralAudioProcessor {
             hop_length: cfg.hop_length,
             window_size: cfg.window_size,
             global_log_mel_max: cfg.global_log_mel_max as f32,
+        }
+    }
+
+    /// Build a processor from raw mel parameters (used by sibling encoders without an `AudioEncodingArgs`).
+    /// `global_log_mel_max` is ignored when the caller drives `process_audio_with` with a non-global floor.
+    pub(crate) fn new_raw(
+        sampling_rate: u32,
+        frame_rate: f32,
+        num_mel_bins: usize,
+        hop_length: usize,
+        window_size: usize,
+        global_log_mel_max: f32,
+    ) -> Self {
+        Self {
+            sampling_rate,
+            frame_rate,
+            num_mel_bins,
+            hop_length,
+            window_size,
+            global_log_mel_max,
         }
     }
 
@@ -72,7 +110,8 @@ impl VoxtralAudioProcessor {
         let mut padded = vec![0.0f32; left_pad + samples.len() + right_pad];
         padded[left_pad..left_pad + samples.len()].copy_from_slice(&samples);
 
-        let mel = self.compute_mel_spectrogram(&padded)?;
+        let mel =
+            self.compute_mel_spectrogram(&padded, LogMelFloor::GlobalConstant(self.global_log_mel_max))?;
         let num_frames = mel.len();
         if num_frames == 0 {
             anyhow::bail!("Audio too short to produce mel frames");
@@ -80,6 +119,52 @@ impl VoxtralAudioProcessor {
 
         let data: Vec<f32> = mel.into_iter().flatten().collect();
 
+        let tensor = Tensor::from_vec(data, (1, num_frames, self.num_mel_bins), device)?;
+        Ok(tensor)
+    }
+
+    /// Parametric mel pipeline used by sibling encoders (e.g. Whisper).
+    /// Same STFT and Slaney filterbank as `process_audio`; only padding and log-mel floor differ.
+    /// Returns `[1, T, num_mel_bins]`. `T` is exact frames for `SilenceTokens`, fixed for `PadOrTrim`.
+    pub(crate) fn process_audio_with(
+        &self,
+        audio: &AudioInput,
+        device: &Device,
+        floor: LogMelFloor,
+        padding: AudioPaddingPolicy,
+    ) -> Result<Tensor> {
+        let mono = audio.to_mono();
+        let samples = if audio.sample_rate != self.sampling_rate {
+            self.resample(&mono, audio.sample_rate, self.sampling_rate)?
+        } else {
+            mono
+        };
+
+        let padded = match padding {
+            AudioPaddingPolicy::SilenceTokens { left, right } => {
+                let spt = self.samples_per_token();
+                let lp = left * spt;
+                let rp = right * spt;
+                let mut buf = vec![0.0f32; lp + samples.len() + rp];
+                buf[lp..lp + samples.len()].copy_from_slice(&samples);
+                buf
+            }
+            AudioPaddingPolicy::PadOrTrim(target_frames) => {
+                // Whisper-style: pad-or-trim to exactly `target_frames * hop_length` raw samples.
+                let target_samples = target_frames * self.hop_length;
+                let mut buf = vec![0.0f32; target_samples];
+                let n = samples.len().min(target_samples);
+                buf[..n].copy_from_slice(&samples[..n]);
+                buf
+            }
+        };
+
+        let mel = self.compute_mel_spectrogram(&padded, floor)?;
+        let num_frames = mel.len();
+        if num_frames == 0 {
+            anyhow::bail!("Audio too short to produce mel frames");
+        }
+        let data: Vec<f32> = mel.into_iter().flatten().collect();
         let tensor = Tensor::from_vec(data, (1, num_frames, self.num_mel_bins), device)?;
         Ok(tensor)
     }
@@ -108,7 +193,11 @@ impl VoxtralAudioProcessor {
 
     /// Centered STFT mel spectrogram matching `torch.stft(center=True)`.
     /// Applies reflection padding of n_fft//2 on each side, then drops the last STFT frame.
-    fn compute_mel_spectrogram(&self, samples: &[f32]) -> Result<Vec<Vec<f32>>> {
+    fn compute_mel_spectrogram(
+        &self,
+        samples: &[f32],
+        floor: LogMelFloor,
+    ) -> Result<Vec<Vec<f32>>> {
         let n_fft = self.window_size;
         let hop = self.hop_length;
         let n_freqs = n_fft / 2 + 1;
@@ -149,7 +238,11 @@ impl VoxtralAudioProcessor {
         let fft = planner.plan_fft_forward(n_fft);
 
         let mut mel_features = Vec::with_capacity(num_frames);
-        let log_mel_floor = self.global_log_mel_max - 8.0;
+        // Per-spectrogram path needs raw log values first; global path can clamp inline.
+        let global_floor = match floor {
+            LogMelFloor::GlobalConstant(maxv) => Some(maxv - 8.0),
+            LogMelFloor::PerSpectrogramMax => None,
+        };
 
         for frame_idx in 0..num_frames {
             let start = frame_idx * hop;
@@ -173,11 +266,31 @@ impl VoxtralAudioProcessor {
                     }
                 }
                 let log_val = sum.max(1e-10).log10();
-                let clamped = log_val.max(log_mel_floor);
-                mel_frame[mel_idx] = (clamped + 4.0) / 4.0;
+                mel_frame[mel_idx] = match global_floor {
+                    Some(f) => (log_val.max(f) + 4.0) / 4.0,
+                    None => log_val,
+                };
             }
 
             mel_features.push(mel_frame);
+        }
+
+        // Whisper normalization: floor = max(log_mel) - 8.0, then (x + 4) / 4.
+        if matches!(floor, LogMelFloor::PerSpectrogramMax) {
+            let mut global_max = f32::NEG_INFINITY;
+            for frame in &mel_features {
+                for &v in frame {
+                    if v > global_max {
+                        global_max = v;
+                    }
+                }
+            }
+            let f = global_max - 8.0;
+            for frame in mel_features.iter_mut() {
+                for v in frame.iter_mut() {
+                    *v = (v.max(f) + 4.0) / 4.0;
+                }
+            }
         }
 
         Ok(mel_features)

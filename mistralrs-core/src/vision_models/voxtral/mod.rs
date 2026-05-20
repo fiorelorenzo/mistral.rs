@@ -24,7 +24,7 @@ use crate::{
 };
 
 mod adapter;
-mod audio_processing;
+pub(crate) mod audio_processing;
 pub mod config;
 mod encoder;
 mod inputs_processor;
